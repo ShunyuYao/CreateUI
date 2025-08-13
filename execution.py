@@ -1111,13 +1111,6 @@ class PromptQueue:
     # 新增：获取多个任务用于并发执行
     def get_multiple(self, max_tasks=None, timeout=None):
         with self.not_empty:
-            # 只在有任务或状态变化时输出详细日志
-            if len(self.queue) > 0 or len(self.currently_running) > 0:
-                logging.info(f"[CONCURRENT] get_multiple called with max_tasks={max_tasks}, timeout={timeout}")
-                logging.info(f"[CONCURRENT] Current queue length: {len(self.queue)}")
-                logging.info(f"[CONCURRENT] Currently running tasks: {len(self.currently_running)}")
-                logging.info(f"[CONCURRENT] Max concurrent tasks: {self.max_concurrent_tasks}")
-            
             # 如果队列为空，等待任务
             if len(self.queue) == 0:
                 # 静默等待，不输出日志
@@ -1147,11 +1140,10 @@ class PromptQueue:
                 self.currently_running[task_id] = copy.deepcopy(item)
                 self.task_counter += 1
                 items.append((item, task_id))
-                logging.info(f"[CONCURRENT] Got task {task_id} with prompt_id: {item[1]}")
             
             if items:
                 self.server.queue_updated()
-                logging.info(f"[CONCURRENT] Successfully got {len(items)} tasks from queue")
+                logging.info(f"[CONCURRENT] Retrieved {len(items)} new tasks from queue")
             
             return items
 
@@ -1178,9 +1170,8 @@ class PromptQueue:
         with self.mutex:
             # 只在有任务完成时输出日志
             if item_id in self.currently_running:
-                logging.info(f"[CONCURRENT] task_done called for item_id={item_id}")
                 prompt = self.currently_running.pop(item_id)
-                logging.info(f"[CONCURRENT] Removed task {item_id} from currently_running, remaining: {len(self.currently_running)}")
+                logging.info(f"[CONCURRENT] Task {item_id} completed, remaining tasks: {len(self.currently_running)}")
                 
                 if len(self.history) > MAXIMUM_HISTORY_SIZE:
                     self.history.pop(next(iter(self.history)))
@@ -1201,7 +1192,6 @@ class PromptQueue:
                 }
                 self.history[prompt[1]].update(history_result)
                 self.server.queue_updated()
-                logging.info(f"[CONCURRENT] Task {item_id} added to history, queue updated")
             else:
                 # 如果任务不在currently_running中，可能是重复调用
                 logging.warning(f"[CONCURRENT] task_done called for unknown item_id={item_id}")
@@ -1312,7 +1302,6 @@ class ConcurrentPromptExecutor:
     
     async def execute_task_async(self, item, item_id):
         """异步执行单个任务"""
-        logging.info(f"[CONCURRENT] Starting async execution of task {item_id}")
         try:
             # 为每个任务创建独立的执行器
             executor = PromptExecutor(self.server_instance, cache_type=self.cache_type, cache_size=self.cache_size)
@@ -1325,9 +1314,7 @@ class ConcurrentPromptExecutor:
             prompt_id = item[1]
             self.server_instance.last_prompt_id = prompt_id
             
-            logging.info(f"[CONCURRENT] Executing task {item_id} with prompt_id: {prompt_id}")
             await executor.execute_async(item[2], prompt_id, item[3], item[4])
-            logging.info(f"[CONCURRENT] Task {item_id} execution completed successfully")
             
             # 任务完成后的处理
             status = PromptQueue.ExecutionStatus(
@@ -1342,7 +1329,6 @@ class ConcurrentPromptExecutor:
                 executor.history_result, 
                 status
             )
-            logging.info(f"[CONCURRENT] Task {item_id} marked as done in queue")
             
             # 发送执行完成消息
             if self.server_instance.client_id is not None:
@@ -1359,7 +1345,6 @@ class ConcurrentPromptExecutor:
                 if item_id in self.running_tasks:
                     del self.running_tasks[item_id]
             
-            logging.info(f"[CONCURRENT] Task {item_id} cleanup completed")
             return True
             
         except Exception as e:
@@ -1391,15 +1376,8 @@ class ConcurrentPromptExecutor:
     
     def execute_tasks(self, tasks):
         """并发执行多个任务 - 修复版本"""
-        logging.info(f"[CONCURRENT] execute_tasks called with {len(tasks)} tasks")
         if not tasks:
-            logging.info(f"[CONCURRENT] No tasks to execute")
             return
-        
-        # 检查是否在主线程中
-        import threading
-        current_thread = threading.current_thread()
-        logging.info(f"[CONCURRENT] Current thread: {current_thread.name} (main: {current_thread.name == 'MainThread'})")
         
         # 为每个任务创建独立的线程和事件循环
         
@@ -1407,8 +1385,6 @@ class ConcurrentPromptExecutor:
             """在独立线程中执行单个任务"""
             item, item_id = task_data
             thread_id = threading.current_thread().ident
-            thread_name = threading.current_thread().name
-            logging.info(f"[CONCURRENT] Thread {thread_id} ({thread_name}) starting execution of task {item_id}")
             
             # 为每个线程创建独立的事件循环
             loop = asyncio.new_event_loop()
@@ -1416,28 +1392,22 @@ class ConcurrentPromptExecutor:
             
             try:
                 # 执行异步任务
-                logging.info(f"[CONCURRENT] Thread {thread_id} executing task {item_id} in new event loop")
                 result = loop.run_until_complete(self.execute_task_async(item, item_id))
-                logging.info(f"[CONCURRENT] Thread {thread_id} completed task {item_id} with result: {result}")
             except Exception as e:
                 logging.error(f"[CONCURRENT] Thread {thread_id} failed to execute task {item_id}: {e}")
                 import traceback
                 logging.error(f"[CONCURRENT] Thread {thread_id} traceback: {traceback.format_exc()}")
             finally:
                 loop.close()
-                logging.info(f"[CONCURRENT] Thread {thread_id} closed event loop for task {item_id}")
         
         # 使用线程池执行任务
-        logging.info(f"[CONCURRENT] Creating ThreadPoolExecutor with max_workers={self.max_workers}")
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             # 提交所有任务
             futures = []
             for task in tasks:
                 future = executor.submit(execute_single_task, task)
                 futures.append(future)
-                logging.info(f"[CONCURRENT] Submitted task {task[1]} to thread pool")
             
-            logging.info(f"[CONCURRENT] Waiting for {len(futures)} tasks to complete")
             # 等待所有任务完成
             done, not_done = concurrent.futures.wait(futures, timeout=300)  # 5分钟超时
             
@@ -1450,14 +1420,8 @@ class ConcurrentPromptExecutor:
             for i, future in enumerate(done):
                 if future.exception():
                     logging.error(f"[CONCURRENT] Task {i} execution failed: {future.exception()}")
-                else:
-                    try:
-                        result = future.result()
-                        logging.info(f"[CONCURRENT] Task {i} completed successfully with result: {result}")
-                    except Exception as e:
-                        logging.error(f"[CONCURRENT] Task {i} result retrieval failed: {e}")
         
-        logging.info(f"[CONCURRENT] All tasks execution completed")
+
     
     def get_running_task_count(self):
         """获取当前正在运行的任务数量"""

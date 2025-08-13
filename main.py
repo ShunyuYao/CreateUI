@@ -273,8 +273,6 @@ def concurrent_prompt_worker(q, server_instance, max_workers=3):
         """在独立线程中执行单个任务"""
         task_item, task_item_id = task_data
         thread_id = threading.current_thread().ident
-        thread_name = threading.current_thread().name
-        logging.info(f"[CONCURRENT] Thread {thread_id} ({thread_name}) starting execution of task {task_item_id}")
         
         # 为每个线程创建独立的事件循环
         loop = asyncio.new_event_loop()
@@ -282,9 +280,7 @@ def concurrent_prompt_worker(q, server_instance, max_workers=3):
         
         try:
             # 执行异步任务
-            logging.info(f"[CONCURRENT] Thread {thread_id} executing task {task_item_id} in new event loop")
             result = loop.run_until_complete(concurrent_executor.execute_task_async(task_item, task_item_id))
-            logging.info(f"[CONCURRENT] Thread {thread_id} completed task {task_item_id} with result: {result}")
             return result
         except Exception as e:
             logging.error(f"[CONCURRENT] Thread {thread_id} failed to execute task {task_item_id}: {e}")
@@ -293,7 +289,6 @@ def concurrent_prompt_worker(q, server_instance, max_workers=3):
             return None
         finally:
             loop.close()
-            logging.info(f"[CONCURRENT] Thread {thread_id} closed event loop for task {task_item_id}")
 
     try:
         while True:
@@ -319,13 +314,12 @@ def concurrent_prompt_worker(q, server_instance, max_workers=3):
                 queue_items = q.get_multiple(max_tasks=available_slots, timeout=1.0)  # 短超时，快速检查
                 
                 if queue_items:
-                    logging.info(f"[CONCURRENT] Retrieved {len(queue_items)} tasks from queue")
+                    logging.info(f"[CONCURRENT] Retrieved {len(queue_items)} new tasks from queue")
                     
                     # 为每个任务提交到线程池
                     for item, item_id in queue_items:
                         future = thread_pool.submit(execute_single_task, (item, item_id))
                         running_futures.append(future)
-                        logging.info(f"[CONCURRENT] Submitted task {item_id} to thread pool")
                     
                     need_gc = True
                 else:
