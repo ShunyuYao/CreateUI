@@ -234,6 +234,136 @@ def prompt_worker(q, server_instance):
                 hook_breaker_ac10a0.restore_functions()
 
 
+def concurrent_prompt_worker(q, server_instance, max_workers=3):
+    """并发任务处理器，支持同时执行多个任务 - 改进版本"""
+    logging.info(f"[CONCURRENT] Starting concurrent_prompt_worker with max_workers={max_workers}")
+    current_time: float = 0.0
+    cache_type = execution.CacheType.CLASSIC
+    if args.cache_lru > 0:
+        cache_type = execution.CacheType.LRU
+    elif args.cache_none:
+        cache_type = execution.CacheType.DEPENDENCY_AWARE
+
+    # 创建并发执行器
+    concurrent_executor = execution.ConcurrentPromptExecutor(
+        server_instance, 
+        cache_type=cache_type, 
+        cache_size=args.cache_lru,
+        max_workers=max_workers
+    )
+    
+    last_gc_collect = 0
+    need_gc = False
+    gc_collect_interval = 10.0
+    
+    # 存储正在执行的任务
+    running_futures = []
+    import concurrent.futures
+    
+    # 创建线程池
+    thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
+    
+    # 用于控制日志输出频率
+    last_status_log = 0
+    status_log_interval = 300  # 每5分钟输出一次状态日志
+    last_idle_log = 0
+    idle_log_interval = 600  # 每10分钟输出一次空闲日志
+
+    def execute_single_task(task_data):
+        """在独立线程中执行单个任务"""
+        task_item, task_item_id = task_data
+        thread_id = threading.current_thread().ident
+        thread_name = threading.current_thread().name
+        logging.info(f"[CONCURRENT] Thread {thread_id} ({thread_name}) starting execution of task {task_item_id}")
+        
+        # 为每个线程创建独立的事件循环
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        try:
+            # 执行异步任务
+            logging.info(f"[CONCURRENT] Thread {thread_id} executing task {task_item_id} in new event loop")
+            result = loop.run_until_complete(concurrent_executor.execute_task_async(task_item, task_item_id))
+            logging.info(f"[CONCURRENT] Thread {thread_id} completed task {task_item_id} with result: {result}")
+            return result
+        except Exception as e:
+            logging.error(f"[CONCURRENT] Thread {thread_id} failed to execute task {task_item_id}: {e}")
+            import traceback
+            logging.error(f"[CONCURRENT] Thread {thread_id} traceback: {traceback.format_exc()}")
+            return None
+        finally:
+            loop.close()
+            logging.info(f"[CONCURRENT] Thread {thread_id} closed event loop for task {task_item_id}")
+
+    try:
+        while True:
+            timeout = 1000.0
+            if need_gc:
+                timeout = max(gc_collect_interval - (current_time - last_gc_collect), 0.0)
+
+            current_time = time.perf_counter()
+            
+            # 清理已完成的任务
+            completed_count = len([f for f in running_futures if f.done()])
+            running_futures = [f for f in running_futures if not f.done()]
+            
+            # 检查是否还有可用槽位
+            available_slots = max_workers - len(running_futures)
+            
+            # 只在有任务完成时输出日志，避免闲时状态输出
+            if completed_count > 0:
+                logging.info(f"[CONCURRENT] Status: running={len(running_futures)}, available_slots={available_slots}, completed={completed_count}")
+            
+            if available_slots > 0:
+                # 获取新任务
+                queue_items = q.get_multiple(max_tasks=available_slots, timeout=1.0)  # 短超时，快速检查
+                
+                if queue_items:
+                    logging.info(f"[CONCURRENT] Retrieved {len(queue_items)} tasks from queue")
+                    
+                    # 为每个任务提交到线程池
+                    for item, item_id in queue_items:
+                        future = thread_pool.submit(execute_single_task, (item, item_id))
+                        running_futures.append(future)
+                        logging.info(f"[CONCURRENT] Submitted task {item_id} to thread pool")
+                    
+                    need_gc = True
+                else:
+                    # 静默等待，不输出空闲日志
+                    pass
+            else:
+                # 静默等待任务完成，不输出日志
+                time.sleep(0.1)
+
+            flags = q.get_flags()
+            free_memory = flags.get("free_memory", False)
+
+            if flags.get("unload_models", free_memory):
+                logging.info(f"[CONCURRENT] Unloading all models due to flag")
+                comfy.model_management.unload_all_models()
+                need_gc = True
+                last_gc_collect = 0
+
+            if free_memory:
+                logging.info(f"[CONCURRENT] Freeing memory and resetting executor")
+                concurrent_executor.reset()
+                need_gc = True
+                last_gc_collect = 0
+
+            if need_gc:
+                if (current_time - last_gc_collect) > gc_collect_interval:
+                    logging.info(f"[CONCURRENT] Performing garbage collection")
+                    gc.collect()
+                    comfy.model_management.soft_empty_cache()
+                    last_gc_collect = current_time
+                    need_gc = False
+                    hook_breaker_ac10a0.restore_functions()
+    finally:
+        # 关闭线程池
+        thread_pool.shutdown(wait=True)
+        logging.info(f"[CONCURRENT] Thread pool shutdown completed")
+
+
 async def run(server_instance, address='', port=8188, verbose=True, call_on_start=None):
     addresses = []
     for addr in address.split(","):
@@ -325,7 +455,10 @@ def start_comfyui(asyncio_loop=None):
     prompt_server.add_routes()
     hijack_progress(prompt_server)
 
-    threading.Thread(target=prompt_worker, daemon=True, args=(prompt_server.prompt_queue, prompt_server,)).start()
+    # 使用并发执行器，支持同时执行多个任务
+    # 可以通过命令行参数 --max-concurrent-tasks 配置最大并发数
+    max_concurrent_tasks = args.max_concurrent_tasks
+    threading.Thread(target=concurrent_prompt_worker, daemon=True, args=(prompt_server.prompt_queue, prompt_server, max_concurrent_tasks)).start()
 
     if args.quick_test_for_ci:
         exit(0)

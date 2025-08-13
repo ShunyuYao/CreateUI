@@ -158,7 +158,12 @@ class PromptServer():
         self.custom_node_manager = CustomNodeManager()
         self.internal_routes = InternalRoutes(self)
         self.supports = ["custom_nodes_from_web"]
-        self.prompt_queue = execution.PromptQueue(self)
+        
+        # 从命令行参数获取最大并发任务数
+        from comfy.cli_args import args
+        max_concurrent_tasks = getattr(args, 'max_concurrent_tasks', 3)
+        self.prompt_queue = execution.PromptQueue(self, max_concurrent_tasks=max_concurrent_tasks)
+        
         self.loop = loop
         self.messages = asyncio.Queue()
         self.client_session:Optional[aiohttp.ClientSession] = None
@@ -235,7 +240,7 @@ class PromptServer():
                                     sid,
                                 )
 
-                                logging.debug(
+                                logging.info(
                                     f"Feature flags negotiated for client {sid}: {client_flags}"
                                 )
                             first_message = False
@@ -755,6 +760,36 @@ class PromptServer():
                     self.prompt_queue.delete_history_item(id_to_delete)
 
             return web.Response(status=200)
+
+        @routes.get("/concurrent-tasks")
+        async def get_concurrent_tasks(request):
+            """获取当前并发任务配置"""
+            return web.json_response({
+                "max_concurrent_tasks": self.prompt_queue.max_concurrent_tasks,
+                "currently_running": len(self.prompt_queue.currently_running),
+                "queue_length": len(self.prompt_queue.queue)
+            })
+
+        @routes.post("/concurrent-tasks")
+        async def set_concurrent_tasks(request):
+            """设置最大并发任务数"""
+            json_data = await request.json()
+            if "max_concurrent_tasks" in json_data:
+                new_max = int(json_data["max_concurrent_tasks"])
+                if new_max > 0:
+                    self.prompt_queue.set_max_concurrent_tasks(new_max)
+                    return web.json_response({
+                        "success": True,
+                        "max_concurrent_tasks": new_max
+                    })
+                else:
+                    return web.json_response({
+                        "error": "max_concurrent_tasks must be greater than 0"
+                    }, status=400)
+            else:
+                return web.json_response({
+                    "error": "max_concurrent_tasks parameter is required"
+                }, status=400)
 
     async def setup(self):
         timeout = aiohttp.ClientTimeout(total=None) # no timeout
